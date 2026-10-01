@@ -86,15 +86,29 @@ def main():
     L0 = nll(pm)
     print(f"[audit] L0(evaluator)={L0:.4f} over {len(texts)} samples", flush=True)
 
+    def resolve(sd, k):
+        """PEFT adapter-name infix: stored deltas lack '.default' (lora_A.weight
+        vs lora_A.default.weight). Try direct, then adapter-suffixed."""
+        if k in sd:
+            return k
+        for tag in ("lora_A.weight", "lora_B.weight",
+                    "lora_embedding_A.weight", "lora_embedding_B.weight"):
+            if k.endswith(tag):
+                c = k[: -len(tag)] + tag.replace(".weight", ".default.weight")
+                if c in sd:
+                    return c
+        return None
+
     def with_delta(path):
         d = load_adapter_state(path)
         sd0 = pm.state_dict()
-        backup = {k: sd0[k].detach().clone() for k in d if k in sd0}
+        pairs = [(resolve(sd0, k), v) for k, v in d.items()]
+        pairs = [(c, v) for c, v in pairs if c is not None]
+        print(f"[audit] applying {len(pairs)}/{len(d)} tensors", flush=True)
+        backup = {c: sd0[c].detach().clone() for c, _ in pairs}
         with torch.no_grad():
-            sd = pm.state_dict()
-            for k, v in d.items():
-                if k in sd:
-                    sd[k].copy_(sd[k] + v.to(sd[k].device, dtype=sd[k].dtype))
+            for c, v in pairs:
+                sd0[c].copy_(sd0[c] + v.to(sd0[c].device, dtype=sd0[c].dtype))
         return backup
 
     def restore(backup):
