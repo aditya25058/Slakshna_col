@@ -211,6 +211,7 @@ def flatten_tensors(delta_dict):
             tensors.append(delta_dict[k].flatten())
     if not tensors:
         return torch.tensor([])
+    return torch.cat(tensors)
 
 
 def _veto_resolve(sd, k):
