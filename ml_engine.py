@@ -211,7 +211,116 @@ def flatten_tensors(delta_dict):
             tensors.append(delta_dict[k].flatten())
     if not tensors:
         return torch.tensor([])
-    return torch.cat(tensors)
+
+
+def _veto_resolve(sd, k):
+    """PEFT adapter-name infix (stored deltas lack '.default')."""
+    if k in sd:
+        return k
+    for tag in ("lora_A.weight", "lora_B.weight"):
+        if k.endswith(tag):
+            c = k[: -len(tag)] + tag.replace(".weight", ".default.weight")
+            if c in sd:
+                return c
+    return None
+
+
+def behavioral_veto(my_id, template_config, ref_sd, available_deltas,
+                     peer_improvements, w_i, state, health_loss):
+    """S-3b: behavioral poisoning veto, alongside (not replacing) cosine trust.
+
+    For suspect peers (positive cosine = would-be weight gainers), apply their
+    delta to own reference adapter and measure held-out NLL spike. spike >
+    bound with a healthy evaluator => subtract veto_strength from alpha[j].
+    Opt-in via SLAKSHNA_VETO=1 (default off: baseline behavior untouched).
+    Never raises into the caller (wrap site also guards).
+    Returns {peer: spike} for scored suspects.
+    """
+    out = {}
+    bound = float(os.environ.get("SLAKSHNA_VETO_BOUND", "1.0"))
+    n_samples = int(os.environ.get("SLAKSHNA_VETO_SAMPLES", "32"))
+    max_peers = int(os.environ.get("SLAKSHNA_VETO_MAX_PEERS", "3"))
+    health = float(os.environ.get("SLAKSHNA_VETO_HEALTH", "4.0"))
+    strength = float(os.environ.get("SLAKSHNA_VETO_STRENGTH", "2.0"))
+    data_offset = int(os.environ.get("SLAKSHNA_VETO_OFFSET", "5000"))
+    if health_loss >= health:
+        print(f"[{my_id}] [veto] abstain (evaluator loss {health_loss:.2f} >= {health})",
+              file=sys.stderr)
+        return out
+    suspects = sorted(
+        (j for j in available_deltas
+         if j != my_id and peer_improvements.get(j, 0.0) > 0.0),
+        key=lambda j: -peer_improvements.get(j, 0.0))[:max(0, max_peers)]
+    if not suspects:
+        return out
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from datasets import load_dataset as _load_ds
+    from peft import LoraConfig, get_peft_model
+    base_id = template_config.get("model", {}).get(
+        "name", "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T")
+    dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    tok = AutoTokenizer.from_pretrained(base_id)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    model = AutoModelForCausalLM.from_pretrained(base_id, torch_dtype=torch.bfloat16).to(dev)
+    model.eval()
+    a0 = next(k for k in ref_sd if k.endswith("lora_A.weight"))
+    rank = ref_sd[a0].shape[0]
+    targets = sorted({k.split(".")[-3] for k in ref_sd if k.endswith("lora_A.weight")})
+    pm = get_peft_model(model, LoraConfig(r=rank, lora_alpha=2 * rank, lora_dropout=0.0,
+                                          target_modules=targets, bias="none",
+                                          task_type="CAUSAL_LM"))
+    pm.eval()
+    sd0 = pm.state_dict()
+    with torch.no_grad():
+        for k, v in ref_sd.items():
+            c = _veto_resolve(sd0, k)
+            if c is not None:
+                sd0[c].copy_(v.to(sd0[c].device, dtype=sd0[c].dtype))
+    ds = _load_ds("timdettmers/openassistant-guanaco",
+                  split=f"train[{data_offset}:{data_offset + n_samples}]")
+    texts = [r["text"][:1024] for r in ds]
+
+    @torch.no_grad()
+    def nll():
+        tot, n = 0.0, 0
+        for t in texts:
+            ids = tok(t, return_tensors="pt", truncation=True, max_length=256).input_ids.to(dev)
+            if ids.shape[1] < 8:
+                continue
+            tot += float(pm(input_ids=ids, labels=ids).loss)
+            n += 1
+        return tot / max(1, n)
+
+    L0 = nll()
+    for j in suspects:
+        d = available_deltas[j]
+        pairs = [(_veto_resolve(sd0, k), v) for k, v in d.items()]
+        pairs = [(c, v) for c, v in pairs if c is not None]
+        if not pairs:
+            continue
+        backup = {c: sd0[c].detach().clone() for c, _ in pairs}
+        with torch.no_grad():
+            for c, v in pairs:
+                sd0[c].copy_(sd0[c] + v.to(sd0[c].device, dtype=sd0[c].dtype))
+        L1 = nll()
+        with torch.no_grad():
+            for c, v in backup.items():
+                sd0[c].copy_(v)
+        spike = L1 - L0
+        out[j] = spike
+        if spike > bound:
+            state["alpha"][j] = state.get("alpha", {}).get(j, 0.0) - strength
+            print(json.dumps({"veto": True, "node": my_id, "peer": j,
+                              "L0": round(L0, 4), "L1": round(L1, 4),
+                              "spike": round(spike, 4), "bound": bound}),
+                  file=sys.stderr)
+    del model, pm
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return out
 
 def log_runtime(my_id, event, **kwargs):
     row = {
@@ -797,6 +906,21 @@ def main():
         step = beta * Delta_L_j * w_i[j] * (1.0 - w_i[j])
         state["alpha"][j] += step
         state["alpha"][j] *= 0.98
+
+    # S-3b behavioral veto (opt-in SLAKSHNA_VETO=1; composes with cosine trust,
+    # never replaces it; never raises into the round on failure).
+    if os.environ.get("SLAKSHNA_VETO", "0") == "1":
+        try:
+            try:
+                _health = float(loss) if loss is not None else 999.0
+            except NameError:
+                _health = 999.0
+            _ref = {k: (old_sd[k] + delta_i[k] if k in delta_i else old_sd[k])
+                    for k in old_sd}
+            behavioral_veto(my_id, template_config, _ref, available_deltas,
+                            peer_improvements, w_i, state, _health)
+        except Exception as e:
+            print(f"[{my_id}] [veto] skipped: {type(e).__name__}: {e}", file=sys.stderr)
 
     score = final_epoch_score
     state["score"] = score
