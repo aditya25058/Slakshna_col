@@ -34,6 +34,20 @@ def load_adapter_state(path):
     return sd
 
 
+def resolve(sd, k):
+    """PEFT adapter-name infix: stored deltas lack '.default' (lora_A.weight
+    vs lora_A.default.weight). Try direct, then adapter-suffixed."""
+    if k in sd:
+        return k
+    for tag in ("lora_A.weight", "lora_B.weight",
+                "lora_embedding_A.weight", "lora_embedding_B.weight"):
+        if k.endswith(tag):
+            c = k[: -len(tag)] + tag.replace(".weight", ".default.weight")
+            if c in sd:
+                return c
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", required=True)
@@ -85,19 +99,6 @@ def main():
 
     L0 = nll(pm)
     print(f"[audit] L0(evaluator)={L0:.4f} over {len(texts)} samples", flush=True)
-
-    def resolve(sd, k):
-        """PEFT adapter-name infix: stored deltas lack '.default' (lora_A.weight
-        vs lora_A.default.weight). Try direct, then adapter-suffixed."""
-        if k in sd:
-            return k
-        for tag in ("lora_A.weight", "lora_B.weight",
-                    "lora_embedding_A.weight", "lora_embedding_B.weight"):
-            if k.endswith(tag):
-                c = k[: -len(tag)] + tag.replace(".weight", ".default.weight")
-                if c in sd:
-                    return c
-        return None
 
     def with_delta(path):
         d = load_adapter_state(path)
