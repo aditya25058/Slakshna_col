@@ -36,6 +36,9 @@ def main():
     ap.add_argument("--n", type=int, default=32)
     ap.add_argument("--data_offset", type=int, default=5000)
     ap.add_argument("--bound", type=float, default=1.0)
+    ap.add_argument("--health_l0", type=float, default=4.0,
+                    help="evaluators with L0 above this abstain (wrecked models "
+                         "cannot distinguish poison; their votes are uninformative)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     nodes = args.nodes.split(",")
@@ -97,10 +100,16 @@ def main():
                     sd0[c].copy_(v.to(sd0[c].device, dtype=sd0[c].dtype))
 
     out, tot_fp, tot_hon, tot_det, tot_pois = {}, 0, 0, 0, 0
+    abstained = []
     for ev in nodes:
         load_into(os.path.join(args.model_dir, f"{ev}_base_lora.pth"))
         L0 = nll(pm)
-        out[ev] = {"L0": L0, "peers": {}}
+        healthy = bool(L0 < args.health_l0)
+        if not healthy:
+            abstained.append(ev)
+        out[ev] = {"L0": L0, "healthy": healthy, "peers": {}}
+        if not healthy:
+            continue
         for peer in nodes:
             if peer == ev:
                 continue
@@ -121,7 +130,9 @@ def main():
         print(f"[matrix] {ev}: L0={L0:.3f} done", flush=True)
     out["summary"] = {"detection": f"{tot_det}/{tot_pois}",
                       "false_positives": f"{tot_fp}/{tot_hon}",
-                      "bound": args.bound}
+                      "bound": args.bound,
+                      "health_l0": args.health_l0,
+                      "abstained": abstained}
     with open(args.out, "w") as f:
         json.dump(out, f, indent=2)
     print(f"[matrix] detection {tot_det}/{tot_pois}, FP {tot_fp}/{tot_hon}", flush=True)
